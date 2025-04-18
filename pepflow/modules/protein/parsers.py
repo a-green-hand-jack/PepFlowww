@@ -17,16 +17,38 @@ from Bio.SeqUtils import seq1
 
 
 def _get_residue_heavyatom_info(res: Residue):
+    """提取单个残基的重原子信息（坐标、存在掩码、B因子）
+    
+    Args:
+        res (Bio.PDB.Residue): BioPython 的残基对象
+    
+    Returns:
+        tuple: 
+            - pos_heavyatom: 重原子坐标张量 [max_num_heavyatoms, 3]
+            - mask_heavyatom: 原子存在掩码 [max_num_heavyatoms]
+            - bfactor_heavyatom: B因子张量 [max_num_heavyatoms]
+    """
+    # 初始化输出张量（预设最大原子数）
     pos_heavyatom = torch.zeros([max_num_heavyatoms, 3], dtype=torch.float)
     mask_heavyatom = torch.zeros([max_num_heavyatoms, ], dtype=torch.bool)
     bfactor_heavyatom = torch.zeros([max_num_heavyatoms, ], dtype=torch.float)
-    restype = AA(res.get_resname())
+    
+    # 获取残基类型对应的标准原子名列表
+    restype = AA(res.get_resname())  # 转换为AA枚举类型
     for idx, atom_name in enumerate(restype_to_heavyatom_names[restype]):
-        if atom_name == '': continue
+        if atom_name == '':  # 跳过空原子名（占位符）
+            continue  
+        
+        # 如果当前原子存在于残基中
         if atom_name in res:
-            pos_heavyatom[idx] = torch.tensor(res[atom_name].get_coord().tolist(), dtype=pos_heavyatom.dtype)
-            mask_heavyatom[idx] = True
-            bfactor_heavyatom[idx] = res[atom_name].get_bfactor()
+            # 记录原子坐标（转换为torch张量）
+            pos_heavyatom[idx] = torch.tensor(
+                res[atom_name].get_coord().tolist(),
+                dtype=pos_heavyatom.dtype
+            )
+            mask_heavyatom[idx] = True  # 标记原子存在
+            bfactor_heavyatom[idx] = res[atom_name].get_bfactor()  # 记录B因子
+    
     return pos_heavyatom, mask_heavyatom, bfactor_heavyatom
 
 
@@ -66,100 +88,110 @@ def parse_mmcif_assembly(path, model_id, assembly_id=0, unknown_threshold=1.0):
 
 
 def parse_biopython_structure(entity, unknown_threshold=1.0):
-    chains = Selection.unfold_entities(entity, 'C')
-    chains.sort(key=lambda c: c.get_id())
+    """
+    将 BioPython 的 PDB/MMCIF 结构对象解析为标准化张量格式
+    
+    Args:
+        entity: BioPython 的结构对象 (Model/Chain/Residue 或其组合)
+        unknown_threshold: 允许的未知氨基酸比例阈值 (超过则返回None)
+    
+    Returns:
+        tuple: (data, seq_map)
+            - data: EasyDict 包含解析后的张量数据
+            - seq_map: 字典 {(chain_id, resseq, icode): 残基索引}
+    """
+    # 1. 展开所有链并排序
+    chains = Selection.unfold_entities(entity, 'C')  # 获取所有链
+    chains.sort(key=lambda c: c.get_id())  # 按链ID排序
+
+    # 2. 初始化数据结构
     data = EasyDict({
-        'chain_id': [], 'chain_nb': [],
-        'resseq': [], 'icode': [], 'res_nb': [],
-        'aa': [],
-        'pos_heavyatom': [], 'mask_heavyatom': [],
-        # 'pos_hydrogen': [], 'mask_hydrogen': [],
-        # 'bfactor_heavyatom': [],
+        'chain_id': [], 'chain_nb': [],      # 链标识符和编号
+        'resseq': [], 'icode': [], 'res_nb': [],  # PDB残基编号/插入码/内部连续编号
+        'aa': [],                           # 氨基酸类型 (AA枚举值)
+        'pos_heavyatom': [], 'mask_heavyatom': [],  # 重原子坐标和存在掩码
+        # 注释掉的氢原子和B因子相关字段
     })
+
+    # 3. 定义张量转换方法
     tensor_types = {
         'chain_nb': torch.LongTensor,
         'resseq': torch.LongTensor,
         'res_nb': torch.LongTensor,
         'aa': torch.LongTensor,
-        'pos_heavyatom': torch.stack,
-        'mask_heavyatom': torch.stack,
-        # 'bfactor_heavyatom': torch.stack,
-        # 'pos_hydrogen': torch.stack,
-        # 'mask_hydrogen': torch.stack,
+        'pos_heavyatom': torch.stack,  # 堆叠为 [N_res, max_num_heavyatoms, 3]
+        'mask_heavyatom': torch.stack,  # 堆叠为 [N_res, max_num_heavyatoms]
     }
 
-    count_aa, count_unk = 0, 0
+    count_aa, count_unk = 0, 0  # 统计氨基酸和未知类型数量
 
+    # 4. 遍历处理每个残基
     for i, chain in enumerate(chains):
-        seq_this = 0   # Renumbering residues
-        residues = Selection.unfold_entities(chain, 'R')
-        residues.sort(key=lambda res: (res.get_id()[1], res.get_id()[2]))   # Sort residues by resseq-icode
-        for _, res in enumerate(residues):
+        seq_this = 0  # 当前链的内部连续编号
+        residues = Selection.unfold_entities(chain, 'R')  # 获取链中所有残基
+        residues.sort(key=lambda res: (res.get_id()[1], res.get_id()[2]))  # 按(resseq, icode)排序
+
+        for res in residues:
             resname = res.get_resname()
+            # 跳过非标准氨基酸或缺少主链原子的残基
             if not AA.is_aa(resname): continue
             if not (res.has_id('CA') and res.has_id('C') and res.has_id('N')): continue
-            restype = AA(resname)
+
+            restype = AA(resname)  # 转换为枚举类型
             count_aa += 1
-            if restype == AA.UNK: 
+            if restype == AA.UNK:  # 统计未知类型
                 count_unk += 1
                 continue
 
-            # Chain info
+            # 5. 记录链信息
             data.chain_id.append(chain.get_id())
             data.chain_nb.append(i)
 
-            # Residue types
-            data.aa.append(restype) # Will be automatically cast to torch.long
+            # 6. 记录氨基酸类型
+            data.aa.append(restype)
 
-            # Heavy atoms
-            pos_heavyatom, mask_heavyatom, bfactor_heavyatom = _get_residue_heavyatom_info(res)
+            # 7. 提取重原子信息 (坐标/掩码/B因子)
+            pos_heavyatom, mask_heavyatom, _ = _get_residue_heavyatom_info(res)
             data.pos_heavyatom.append(pos_heavyatom)
             data.mask_heavyatom.append(mask_heavyatom)
-            # data.bfactor_heavyatom.append(bfactor_heavyatom)
 
-            # Hydrogen atoms
-            # pos_hydrogen, mask_hydrogen = _get_residue_hydrogen_info(res)
-            # data.pos_hydrogen.append(pos_hydrogen)
-            # data.mask_hydrogen.append(mask_hydrogen)
-
-            # Sequential number
-            resseq_this = int(res.get_id()[1])
-            icode_this = res.get_id()[2]
+            # 8. 生成连续残基编号 (处理缺失残基)
+            resseq_this = res.get_id()[1]  # PDB中的残基编号
+            icode_this = res.get_id()[2]   # 插入码
             if seq_this == 0:
                 seq_this = 1
             else:
-                d_CA_CA = torch.linalg.norm(data.pos_heavyatom[-2][BBHeavyAtom.CA] - data.pos_heavyatom[-1][BBHeavyAtom.CA], ord=2).item()
-                if d_CA_CA <= 4.0:
+                # 通过CA-CA距离判断是否连续
+                prev_CA = data.pos_heavyatom[-2][BBHeavyAtom.CA]
+                curr_CA = data.pos_heavyatom[-1][BBHeavyAtom.CA]
+                d_CA_CA = torch.linalg.norm(prev_CA - curr_CA, ord=2).item()
+                
+                if d_CA_CA <= 4.0:  # 正常肽键距离
                     seq_this += 1
-                else:
+                else:  # 处理缺失残基
                     d_resseq = resseq_this - data.resseq[-1]
                     seq_this += max(2, d_resseq)
 
+            # 记录残基编号信息
             data.resseq.append(resseq_this)
             data.icode.append(icode_this)
             data.res_nb.append(seq_this)
 
-    if len(data.aa) == 0:
+    # 9. 检查有效残基数量和未知比例
+    if len(data.aa) == 0 or (count_unk / count_aa) >= unknown_threshold:
         return None, None
 
-    if (count_unk / count_aa) >= unknown_threshold:
-        return None, None
+    # 10. 创建残基索引映射表
+    seq_map = {
+        (chain_id, resseq, icode): i 
+        for i, (chain_id, resseq, icode) in enumerate(zip(data.chain_id, data.resseq, data.icode))
+    }
 
-    seq_map = {}
-    for i, (chain_id, resseq, icode) in enumerate(zip(data.chain_id, data.resseq, data.icode)):
-        seq_map[(chain_id, resseq, icode)] = i
-
+    # 11. 转换为PyTorch张量
     for key, convert_fn in tensor_types.items():
         data[key] = convert_fn(data[key])
-    
-    # # ignore UNKNOWN residues and nobackbone residues, true for used residue
-    # seq_mask = data['aa'] != AA.UNK
-    # bb_mask = data['mask_heavyatom'][:, BBHeavyAtom.CA] & data['mask_heavyatom'][:, BBHeavyAtom.C] & data['mask_heavyatom'][:, BBHeavyAtom.N]
-    # data['res_mask'] = seq_mask & bb_mask
 
     return data, seq_map
-    
-
 def get_fasta_from_pdb(pdb_file):
     parser = PDBParser()
     seq_dic = {}
