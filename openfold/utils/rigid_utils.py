@@ -280,7 +280,7 @@ def invert_rot_mat(rot_mat: torch.Tensor):
 
 
 def invert_quat(quat: torch.Tensor):
-    quat_prime = quat.clone()
+    quat_prime = quat.clone()   # TODO:这个 clone 非常可恶,后面还是要去除
     quat_prime[..., 1:] *= -1
     inv = quat_prime / torch.sum(quat ** 2, dim=-1, keepdim=True)
     return inv
